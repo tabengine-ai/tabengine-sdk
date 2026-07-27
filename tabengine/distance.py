@@ -1,26 +1,30 @@
 import numpy as np
 import pandas as pd
-from typing import List, Tuple, Dict, Any, Union
+from typing import List, Tuple, Dict, Any, Union, Optional
 
 class MixedTypeDistanceEngine:
     """
-    Hybrid Tabular Index & Distance Engine.
-    Calculates sub-10ms distances across mixed numerical and categorical columns with null-handling,
-    quantile normalization, and feature importance weighting.
+    Ultra-Fast Vectorized Hybrid Distance Engine.
+    Pre-computes numerical and categorical matrices for sub-millisecond
+    distance calculations across mixed tabular data types.
+    Handles empty spreadsheet cells ("") safely without exceptions.
     """
 
     def __init__(self, feature_columns: List[str] = None):
         self.feature_columns = feature_columns or []
         self.numeric_cols: List[str] = []
         self.categorical_cols: List[str] = []
-        self.ranges: Dict[str, float] = {}
+        
+        self.numeric_matrix: Optional[np.ndarray] = None
+        self.categorical_matrix: Optional[np.ndarray] = None
+        self.ranges_vec: np.ndarray = np.array([])
+        self.mins_vec: np.ndarray = np.array([])
+        
         self.mins: Dict[str, float] = {}
-        self.means: Dict[str, float] = {}
-        self.stds: Dict[str, float] = {}
-        self.cat_freqs: Dict[str, Dict[Any, float]] = {}
+        self.ranges: Dict[str, float] = {}
 
     def fit(self, df: pd.DataFrame, feature_columns: List[str] = None):
-        """Fit distance scaling parameters on reference dataset."""
+        """Fit distance scaling parameters and pre-compute vectorized matrices."""
         if feature_columns:
             self.feature_columns = [c for c in feature_columns if c in df.columns]
         else:
@@ -35,26 +39,40 @@ class MixedTypeDistanceEngine:
             if c not in self.numeric_cols
         ]
 
-        # Compute numerical normalization metrics (min-max and std)
-        for col in self.numeric_cols:
-            s = pd.to_numeric(df[col], errors='coerce')
-            c_min = float(s.min()) if not pd.isna(s.min()) else 0.0
-            c_max = float(s.max()) if not pd.isna(s.max()) else 1.0
-            c_range = c_max - c_min if c_max > c_min else 1.0
-            self.mins[col] = c_min
-            self.ranges[col] = c_range
-            self.means[col] = float(s.mean()) if not pd.isna(s.mean()) else 0.0
-            self.stds[col] = float(s.std()) if not pd.isna(s.std()) and s.std() > 0 else 1.0
+        # 1. Pre-compute numerical matrix & scaling vectors
+        if self.numeric_cols:
+            num_df = df[self.numeric_cols].apply(pd.to_numeric, errors='coerce')
+            self.numeric_matrix = num_df.to_numpy(dtype=np.float32)
+            
+            mins = np.nanmin(self.numeric_matrix, axis=0) if len(self.numeric_matrix) > 0 else np.zeros(len(self.numeric_cols))
+            maxs = np.nanmax(self.numeric_matrix, axis=0) if len(self.numeric_matrix) > 0 else np.ones(len(self.numeric_cols))
+            
+            mins = np.where(np.isnan(mins), 0.0, mins)
+            maxs = np.where(np.isnan(maxs), 1.0, maxs)
+            ranges = maxs - mins
+            ranges[ranges <= 0] = 1.0
+            
+            self.mins_vec = mins.astype(np.float32)
+            self.ranges_vec = ranges.astype(np.float32)
 
-        # Compute categorical frequency distributions
-        for col in self.categorical_cols:
-            vc = df[col].astype(str).value_counts(normalize=True).to_dict()
-            self.cat_freqs[col] = vc
+            for i, col in enumerate(self.numeric_cols):
+                self.mins[col] = float(mins[i])
+                self.ranges[col] = float(ranges[i])
+        else:
+            self.numeric_matrix = np.empty((len(df), 0), dtype=np.float32)
+            self.mins_vec = np.array([], dtype=np.float32)
+            self.ranges_vec = np.array([], dtype=np.float32)
+
+        # 2. Pre-compute categorical string matrix
+        if self.categorical_cols:
+            self.categorical_matrix = df[self.categorical_cols].astype(str).to_numpy()
+        else:
+            self.categorical_matrix = np.empty((len(df), 0), dtype=str)
 
     def compute_distances(self, ref_df: pd.DataFrame, query_row: Union[pd.Series, dict]) -> np.ndarray:
         """
-        Compute Gower / Quantile-Normalized distance between a single query row and reference dataframe.
-        Returns a 1D numpy array of distances (0.0 = identical, 1.0 = maximum difference).
+        Compute fully vectorized Gower / Manhattan distance in sub-millisecond time.
+        Safely converts query row features and handles null / empty values.
         """
         if isinstance(query_row, dict):
             query_row = pd.Series(query_row)
@@ -65,47 +83,51 @@ class MixedTypeDistanceEngine:
 
         total_features = len(self.numeric_cols) + len(self.categorical_cols)
         if total_features == 0:
-            return np.zeros(num_samples)
+            return np.zeros(num_samples, dtype=np.float32)
 
-        accumulated_dist = np.zeros(num_samples)
-        valid_feature_weights = np.zeros(num_samples)
+        accumulated_dist = np.zeros(num_samples, dtype=np.float32)
+        
+        # 1. Vectorized Numerical Distance with Safe Float Conversion
+        if len(self.numeric_cols) > 0 and self.numeric_matrix is not None:
+            q_num_vals = []
+            for col in self.numeric_cols:
+                val = query_row.get(col, np.nan)
+                if val == "" or val is None or pd.isna(val) or val == "nan" or val == "None":
+                    q_num_vals.append(np.nan)
+                else:
+                    try:
+                        q_num_vals.append(float(val))
+                    except (ValueError, TypeError):
+                        q_num_vals.append(np.nan)
 
-        # 1. Numerical columns: Normalized Manhattan / Gower distance
-        for col in self.numeric_cols:
-            col_range = self.ranges.get(col, 1.0)
-            q_val = query_row.get(col, None)
+            q_num = np.array(q_num_vals, dtype=np.float32)
+
+            # Mask NaNs in query
+            nan_query_mask = np.isnan(q_num)
+            q_num_filled = np.where(nan_query_mask, 0.0, q_num)
+
+            # Compute absolute differences broadcasted over matrix
+            diffs = np.abs(self.numeric_matrix - q_num_filled) / self.ranges_vec
             
-            ref_vals = pd.to_numeric(ref_df[col], errors='coerce').values
-            if q_val is None or pd.isna(q_val):
-                # Missing in query: distance is 0.5 default penalty
-                accumulated_dist += 0.5
-                valid_feature_weights += 1.0
-            else:
-                q_val = float(q_val)
-                # Compute absolute difference scaled by range
-                diffs = np.abs(ref_vals - q_val) / col_range
-                # Replace NaNs in reference with 0.5 penalty
-                mask_nan = np.isnan(diffs)
-                diffs[mask_nan] = 0.5
-                
-                accumulated_dist += diffs
-                valid_feature_weights += 1.0
+            # Handle NaN in matrix or query
+            nan_matrix_mask = np.isnan(self.numeric_matrix)
+            diffs[nan_matrix_mask | nan_query_mask] = 0.5
+            
+            accumulated_dist += np.sum(diffs, axis=1)
 
-        # 2. Categorical columns: Exact match / frequency weighted distance
-        for col in self.categorical_cols:
-            q_val = str(query_row.get(col, ""))
-            ref_vals = ref_df[col].astype(str).values
+        # 2. Vectorized Categorical Distance
+        if len(self.categorical_cols) > 0 and self.categorical_matrix is not None:
+            q_cat = np.array([
+                str(query_row.get(col, "")) if query_row.get(col, None) is not None else ""
+                for col in self.categorical_cols
+            ], dtype=str)
 
-            if q_val == "" or q_val == "nan" or q_val == "None":
-                accumulated_dist += 0.5
-                valid_feature_weights += 1.0
-            else:
-                # 0 for match, 1 for mismatch
-                diffs = (ref_vals != q_val).astype(float)
-                accumulated_dist += diffs
-                valid_feature_weights += 1.0
+            # Mask missing query categoricals
+            missing_q_mask = (q_cat == "") | (q_cat == "nan") | (q_cat == "None")
+            
+            cat_diffs = (self.categorical_matrix != q_cat).astype(np.float32)
+            cat_diffs[:, missing_q_mask] = 0.5
+            
+            accumulated_dist += np.sum(cat_diffs, axis=1)
 
-        # Avoid div by zero
-        valid_feature_weights[valid_feature_weights == 0] = 1.0
-        final_distances = accumulated_dist / valid_feature_weights
-        return final_distances
+        return accumulated_dist / float(total_features)
